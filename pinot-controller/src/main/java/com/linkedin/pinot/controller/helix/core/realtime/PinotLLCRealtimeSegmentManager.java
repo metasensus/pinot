@@ -29,10 +29,10 @@ import com.linkedin.pinot.common.metadata.ZKMetadataProvider;
 import com.linkedin.pinot.common.metadata.segment.ColumnPartitionMetadata;
 import com.linkedin.pinot.common.metadata.segment.LLCRealtimeSegmentZKMetadata;
 import com.linkedin.pinot.common.metadata.segment.SegmentPartitionMetadata;
-import com.linkedin.pinot.core.realtime.stream.StreamMetadata;
 import com.linkedin.pinot.common.metrics.ControllerGauge;
 import com.linkedin.pinot.common.metrics.ControllerMeter;
 import com.linkedin.pinot.common.metrics.ControllerMetrics;
+import com.linkedin.pinot.common.partition.PartitionAssignment;
 import com.linkedin.pinot.common.protocols.SegmentCompletionProtocol;
 import com.linkedin.pinot.common.utils.CommonConstants;
 import com.linkedin.pinot.common.utils.LLCSegmentName;
@@ -43,16 +43,16 @@ import com.linkedin.pinot.common.utils.helix.HelixHelper;
 import com.linkedin.pinot.common.utils.retry.RetryPolicies;
 import com.linkedin.pinot.controller.ControllerConf;
 import com.linkedin.pinot.controller.api.events.MetadataEventNotifierFactory;
-import com.linkedin.pinot.common.partition.PartitionAssignment;
 import com.linkedin.pinot.controller.helix.core.PinotHelixResourceManager;
 import com.linkedin.pinot.controller.helix.core.PinotHelixSegmentOnlineOfflineStateModelGenerator;
 import com.linkedin.pinot.controller.helix.core.PinotTableIdealStateBuilder;
 import com.linkedin.pinot.controller.helix.core.realtime.partition.StreamPartitionAssignmentGenerator;
 import com.linkedin.pinot.controller.util.SegmentCompletionUtils;
 import com.linkedin.pinot.core.realtime.impl.kafka.KafkaHighLevelStreamProviderConfig;
+import com.linkedin.pinot.core.realtime.impl.kafka.SimpleConsumerWrapper;
 import com.linkedin.pinot.core.realtime.stream.PinotStreamConsumer;
 import com.linkedin.pinot.core.realtime.stream.PinotStreamConsumerFactory;
-import com.linkedin.pinot.core.realtime.impl.kafka.SimpleConsumerWrapper;
+import com.linkedin.pinot.core.realtime.stream.StreamMetadata;
 import com.linkedin.pinot.core.segment.creator.impl.V1Constants;
 import com.linkedin.pinot.core.segment.index.ColumnMetadata;
 import com.linkedin.pinot.core.segment.index.SegmentMetadataImpl;
@@ -79,6 +79,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import javax.annotation.Nullable;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang.math.IntRange;
@@ -516,7 +517,6 @@ public class PinotLLCRealtimeSegmentManager {
   protected List<ZNRecord> getExistingSegmentMetadata(String realtimeTableName) {
     String propStorePath = ZKMetadataProvider.constructPropertyStorePathForResource(realtimeTableName);
     return _propertyStore.getChildren(propStorePath, null, 0);
-
   }
 
   protected boolean writeSegmentToPropertyStore(String znodePath, ZNRecord znRecord, final String realtimeTableName,
@@ -1391,6 +1391,303 @@ public class PinotLLCRealtimeSegmentManager {
 
   protected List<String> getInstances(String tenantName) {
     return _helixAdmin.getInstancesInClusterWithTag(_clusterName, tenantName);
+  }
+
+  protected List<LLCRealtimeSegmentZKMetadata> getAllSegmentMetadata(String tableNameWithType) {
+    return ZKMetadataProvider.getLLCRealtimeSegmentZKMetadataListForTable(_helixManager.getHelixPropertyStore(), tableNameWithType);
+  }
+
+  // Gets latest 2 metadata. We need only the 2 latest metadata for each partition
+  private Map<Integer, MinMaxPriorityQueue<LLCRealtimeSegmentZKMetadata>> getLatestMetadata(String tableNameWithType) {
+    List<LLCRealtimeSegmentZKMetadata> metadatas = getAllSegmentMetadata(tableNameWithType);
+
+    Comparator<LLCRealtimeSegmentZKMetadata> comparator = new Comparator<LLCRealtimeSegmentZKMetadata>() {
+      @Override
+      public int compare(LLCRealtimeSegmentZKMetadata o1, LLCRealtimeSegmentZKMetadata o2) {
+        LLCSegmentName s1 = new LLCSegmentName(o1.getSegmentName());
+        LLCSegmentName s2 = new LLCSegmentName(o2.getSegmentName());
+        return s2.compareTo(s1);
+      }
+    };
+
+    Map<Integer, MinMaxPriorityQueue<LLCRealtimeSegmentZKMetadata>> partitionToLatestSegments = new HashMap<>();
+
+    for (LLCRealtimeSegmentZKMetadata metadata : metadatas) {
+      LLCSegmentName segmentName = new LLCSegmentName(metadata.getSegmentName());
+      final int partitionId = segmentName.getPartitionId();
+      MinMaxPriorityQueue latestSegments = partitionToLatestSegments.get(partitionId);
+      if (latestSegments == null) {
+        latestSegments = MinMaxPriorityQueue.orderedBy(comparator).maximumSize(2).create();
+        partitionToLatestSegments.put(partitionId, latestSegments);
+      }
+      latestSegments.offer(segmentName);
+    }
+
+    return partitionToLatestSegments;
+  }
+
+  public void validateLLCSegments(final TableConfig tableConfig) {
+    final String tableNameWithType = tableConfig.getTableName();
+    final StreamMetadata streamMetadata = new StreamMetadata(tableConfig.getIndexingConfig().getStreamConfigs());
+    final int partitionCount = getKafkaPartitionCount(streamMetadata);
+    HelixHelper.updateIdealState(_helixManager, tableNameWithType, new Function<IdealState, IdealState>() {
+      @Nullable
+      @Override
+      public IdealState apply(@Nullable IdealState idealState) {
+        return validateLLCSegments(tableConfig, idealState, partitionCount);
+      }
+    }, RetryPolicies.exponentialBackoffRetryPolicy(10, 1000L, 1.2f), true);
+  }
+
+  private void updateIdealStateOnSegmentCompletion(final TableConfig tableConfig, final String currentSegmentId, final String newSegmentId) {
+    final String tableNameWithType = tableConfig.getTableName();
+
+    HelixHelper.updateIdealState(_helixManager, tableNameWithType, new Function<IdealState, IdealState>() {
+      @Nullable
+      @Override
+      public IdealState apply(@Nullable IdealState idealState) {
+        return updateIdealStateOnSegmentCompletion(idealState, tableConfig, currentSegmentId, newSegmentId);
+      }
+    }, RetryPolicies.exponentialBackoffRetryPolicy(10, 1000L, 1.2f));
+  }
+
+
+  private PartitionAssignment getPartitionAssignmentFromIdealState(String tableNameWithType,
+      Map<Integer, MinMaxPriorityQueue<LLCRealtimeSegmentZKMetadata>> latestMetadata,
+      IdealState idealState) {
+    PartitionAssignment partitionAssignment = new PartitionAssignment(tableNameWithType);
+    for (Map.Entry<Integer, MinMaxPriorityQueue<LLCRealtimeSegmentZKMetadata>> entry : latestMetadata.entrySet()) {
+      int partition = entry.getKey();
+      MinMaxPriorityQueue<LLCRealtimeSegmentZKMetadata> priorityQueue = entry.getValue();
+      Map<String, String> instanceStateMap = idealState.getInstanceStateMap(priorityQueue.peekFirst().getSegmentName());
+      if (instanceStateMap == null) {
+        if (priorityQueue.size() > 1) {   // Expects size to be 2
+          instanceStateMap = idealState.getInstanceStateMap(priorityQueue.peekLast().getSegmentName());
+          // We can assert that instanceStateMap cannot be null here. metadata cannot be more than
+          // one segment ahead of idealstate.
+          partitionAssignment.addPartition(Integer.toString(partition), new ArrayList<String>(instanceStateMap.keySet()));
+        }
+      } else {
+        partitionAssignment.addPartition(Integer.toString(partition), new ArrayList<String>(instanceStateMap.keySet()));
+      }
+      // TODO
+      // May be that we had one metadata and no entry in idealstate (table just created). In that case, the partition
+      // is not assigned yet, so we need to assign the partitions.
+    }
+    return partitionAssignment;
+  }
+
+  /*
+   *  A segment commit takes 3 modifications to zookeeper:
+   *  - Change old segment metadata (mark it DONE, and then other things)
+   *  - Add new metadata
+   *  - Update idealstate to change oldsegment to ONLINE and new segment to CONSUMING
+   *
+   * A controller failure before/during the first step, or after the last step, does not bother us.
+   * However, a controller failure after the first step (but before the successful completion of last step)
+   * will result in leaving zookeeper in an inconsistent state. We have logic to trigger a periodic scan
+   * of the segments, and repair those in this intermediate stage of segment completion.
+   *
+   * Now that there are two threads that may try to create new segments, we need to be careful.
+   *
+   * It may happen that the segment completion thread has just done step-1, but meanwhile the periodic
+   * validator triggers, and mistakes this segment to be in incomplete state.
+   *
+   * We check the segment's metadata to see if that is old enough for repair. If it is fairly new, we
+   * leave it as it is, to be fixed the next time repair job triggers.
+   */
+  private static int MAX_SEGMENT_COMPLETION_TIME_MINS = 10;
+  private boolean isTooSoonToCorrect(String tableNameWithType, String segmentId) {
+    long now = System.currentTimeMillis();
+    Stat stat = new Stat();
+    LLCRealtimeSegmentZKMetadata metadata = getRealtimeSegmentZKMetadata(tableNameWithType, segmentId, stat);
+    long metadataUpdateTime = stat.getMtime();
+    if (now < metadataUpdateTime + TimeUnit.MILLISECONDS.convert(MAX_SEGMENT_COMPLETION_TIME_MINS, TimeUnit.MINUTES)) {
+      // too soon to correct
+      return true;
+    }
+    return false;
+  }
+
+  /*
+   * Validate LLC segments of a table.
+   *
+   * This method combines the logic in the previous completeCommitingSegmentsInternal()
+   * and createConsumingSegment() methods.
+   *
+   * So, the method may:
+   * - Add or modify one or more segment metadata znodes
+   * - Update the idealstate, which may fail if some other process updated the idealstate.
+   *
+   * In case idealstate update fails, then we need to start over.
+   *
+   * TODO Verify right things happen in the following case:
+   * - A segment completion is triggered, that manages to update metadata but ideal state update fails
+   *   and so it is currently in back-off stage.
+   * - ValidationManager starts to run, and finds the segment in improper state and manages to fix it in idealstate.
+   * - The segment completion thread comes back to update the ideal state (should already find the same segment in there)
+   *
+   * TODO Can we re-use this method when creating a table as well?
+   *
+   */
+  private IdealState validateLLCSegments(final TableConfig tableConfig, IdealState idealState, final int partitionCount) {
+    final String tableNameWithType = tableConfig.getTableName();
+    final StreamMetadata streamMetadata = new StreamMetadata(tableConfig.getIndexingConfig().getStreamConfigs());
+    if (!idealState.isEnabled()) {
+      LOGGER.info("Skipping validation for disabled table {}", tableNameWithType);
+      return idealState;
+    }
+
+    // Get the metadata for the latest 2 segments of each partition
+    Map<Integer, MinMaxPriorityQueue<LLCRealtimeSegmentZKMetadata>> latestMetadata = getLatestMetadata(tableNameWithType);
+
+    // Find partitions for which there is no metadata at all. These are new partitions that we need to start consuming.
+    Set<Integer> newPartitions = new HashSet<>(partitionCount);
+    for (int partition = 0; partition < partitionCount; partition++) {
+      if (!latestMetadata.containsKey(partition)) {
+        LOGGER.info("Found partition {} with no segments", partition);
+        newPartitions.add(partition);
+      }
+    }
+
+    // TODO How to we assign hosts to unassigned partitions?
+    PartitionAssignment partitionAssignment = getPartitionAssignmentFromIdealState(tableNameWithType,
+        latestMetadata, idealState);
+
+    // Find partitions to repair
+    for (Map.Entry<Integer, MinMaxPriorityQueue<LLCRealtimeSegmentZKMetadata>> entry : latestMetadata.entrySet()) {
+      int partition = entry.getKey();
+      MinMaxPriorityQueue<LLCRealtimeSegmentZKMetadata> priorityQueue = entry.getValue();
+      LLCRealtimeSegmentZKMetadata metadata = entry.getValue().pollFirst();
+      final String segmentId = metadata.getSegmentName();
+      final LLCSegmentName segmentName = new LLCSegmentName(segmentId);
+      // TODO Handle the case when this partition does not have an instance list as yet in IdealState.
+      List<String> newInstances = partitionAssignment.getInstancesListForPartition(Integer.toString(partition));
+      if (isTooSoonToCorrect(tableNameWithType, segmentId)) {
+        LOGGER.info("Skipping correction of segment segment {} (too soon to correct)", segmentId);
+        continue;
+      }
+
+      if (idealState.getPartitionSet().contains(segmentId)) {
+        // Latest segment of metadata is in idealstate.
+        Map<String, String> instanceStateMap = idealState.getInstanceStateMap(segmentId);
+        if (instanceStateMap.values().contains(PinotHelixSegmentOnlineOfflineStateModelGenerator.CONSUMING_STATE)) {
+          if (metadata.getStatus().equals(CommonConstants.Segment.Realtime.Status.DONE)) {
+            // controller failed between step-1 and step-2 of commitSegmentMetadata.
+            // i.e. after updating old segment metadata (segment metadata state = DONE),
+            // but before creating new segment metadata and updating ideal state (new segment metadata missing, old segment ideal state = CONSUMING)
+            LOGGER.info("{}:Repairing segment for partition {}. " + "Old segment metadata {} has status DONE, but segments are still in CONSUMING state in ideal STATE",
+                tableNameWithType, partition, segmentId);
+
+            final int newSeqNum = segmentName.getSequenceNumber() + 1;
+            // TODO Need to create a method to get the time so that we can test it right.
+            final long now = System.currentTimeMillis();
+            LLCSegmentName newLLCSegmentName =
+                new LLCSegmentName(segmentName.getTableName(), partition, newSeqNum, now);
+
+            LOGGER.info("{}: Creating new segment metadata for {}", tableNameWithType, newLLCSegmentName.getSegmentName());
+
+            // TODO Need to create another method that we can use.
+            createNewSegmentMetadataZNRecord(tableNameWithType, newLLCSegmentName, metadata.getEndOffset(),
+                partitionAssignment);
+            // TODO make this a class method rather than static?
+            updateForNewRealtimeSegment(idealState, newInstances, metadata.getSegmentName(), newLLCSegmentName.getSegmentName());
+          }
+        } else if (instanceStateMap.values().contains(PinotHelixSegmentOnlineOfflineStateModelGenerator.OFFLINE_STATE)) {
+          // An in-progress segment marked itself offline, for some reason the server could not consume.
+          int nextSeqNum = segmentName.getSequenceNumber() + 1;
+          LOGGER.info("Creating CONSUMING segment for {} partition {} with seq {}", tableNameWithType, partition,
+              nextSeqNum);
+          // To begin with, set startOffset to the oldest available offset in kafka. Fix it to be the one we want,
+          // depending on what the prev segment had.
+          long startOffset = getKafkaPartitionOffset(streamMetadata, "smallest", partition);
+          LOGGER.info("Found kafka offset {} for table {} for partition {}", startOffset, tableNameWithType, partition);
+          startOffset = getBetterStartOffsetIfNeeded(tableNameWithType, partition, segmentName, startOffset,
+              nextSeqNum);
+          // TODO Need to create a method for getting the time, so that we can test it with time moving forward.
+          LLCSegmentName newLLCSegmentName = new LLCSegmentName(segmentName.getTableName(), partition, nextSeqNum, System.currentTimeMillis());
+
+          // TODO Need to create another method that we can use.
+          createNewSegmentMetadataZNRecord(tableNameWithType, newLLCSegmentName, startOffset,
+              partitionAssignment);
+          updateForNewRealtimeSegment(idealState, newInstances, segmentId, newLLCSegmentName.getSegmentName());
+        }
+        // It can be in ONLINE state, in which case there is no need to repair the segment.
+      } else {
+        // controller failed between step-2 and step-3 of commitSegmentMetadata.
+        // i.e. after updating old segment metadata (old segment metadata state = DONE) and creating new segment metadata (new segment metadata state = IN_PROGRESS),
+        // but before updating ideal state (new segment ideal missing from ideal state)
+
+        LOGGER.info("{}:Repairing segment for partition {}. Segment {} not found in idealstate", tableNameWithType,
+            partition, segmentId);
+
+        LOGGER.info("{}: Assigning segment {} to {}", tableNameWithType, segmentId, newInstances);
+        // TODO Re-write num-partitions in metadata if needed.
+        // If there was a prev segment in the same partition, then we need to fix it to be ONLINE.
+
+        LLCRealtimeSegmentZKMetadata prevMetadata = entry.getValue().pollLast();
+        String prevSegmentId = null;
+        if (prevMetadata != null) {
+          prevSegmentId = prevMetadata.getSegmentName();
+        }
+        // TODO make this a class method rather than static?
+        updateForNewRealtimeSegment(idealState, newInstances, prevSegmentId, segmentId);
+      }
+    }
+
+    for (int partition : newPartitions) {
+      // We will surely not have partition assignment for these, because these are partitions not even in metadata
+      // TODO Change this to get segment assignment for all partitions in one go
+      // For now, assume that the partitions have been assigned.
+      // No segment yet in partition, Create a new one with a starting offset as per table config specification.
+      int nextSeqNum = STARTING_SEQUENCE_NUMBER;
+      LOGGER.info("Creating CONSUMING segment for {} partition {} with seq {}", tableNameWithType, partition,
+          nextSeqNum);
+      String consumerStartOffsetSpec = streamMetadata.getKafkaConsumerProperties()
+          .get(CommonConstants.Helix.DataSource.Realtime.Kafka.AUTO_OFFSET_RESET);
+      long startOffset = getKafkaPartitionOffset(streamMetadata, consumerStartOffsetSpec, partition);
+      LOGGER.info("Found kafka offset {} for table {} for partition {}", startOffset, tableNameWithType, partition);
+      String rawTableName = TableNameBuilder.extractRawTableName(tableNameWithType);
+
+      LLCSegmentName newLLCSegmentName = new LLCSegmentName(rawTableName, partition, nextSeqNum, System.currentTimeMillis());
+
+      // TODO Need to create another method that we can use.
+      createNewSegmentMetadataZNRecord(tableNameWithType, newLLCSegmentName, startOffset,
+          partitionAssignment);
+      List<String> newInstances = partitionAssignment.getInstancesListForPartition(Integer.toString(partition));
+      updateForNewRealtimeSegment(idealState, newInstances, null, newLLCSegmentName.getSegmentName());
+    }
+
+    return idealState;
+  }
+
+  private IdealState updateIdealStateOnSegmentCompletion(IdealState idealState,
+      TableConfig tableConfig, String currentSegmentId, String newSegmentId) {
+
+    List<String> newSegmentInstances = assignmentForCompletingSegment(tableConfig, idealState, newSegmentId);
+    if (currentSegmentId != null) {
+      Set<String> currentSegmentInstances = idealState.getInstanceSet(currentSegmentId);
+      for (String instance : currentSegmentInstances) {
+        idealState.setPartitionState(currentSegmentId, instance, PinotHelixSegmentOnlineOfflineStateModelGenerator.ONLINE_STATE);
+      }
+    }
+
+    // We may have (for whatever reason) a different instance list in the idealstate for the new segment.
+    // If so, clear it, and then set the instance state for the set of instances that we know should be there.
+    Map<String, String> stateMap = idealState.getInstanceStateMap(newSegmentId);
+    if (stateMap != null) {
+      stateMap.clear();
+    }
+    for (String instance : newSegmentInstances) {
+      idealState.setPartitionState(newSegmentId, instance, PinotHelixSegmentOnlineOfflineStateModelGenerator.CONSUMING_STATE);
+    }
+
+    return idealState;
+  }
+
+  // May need to pass partition Id if we want that to be explicit, Otherwise derive it from the segment name.
+  private List<String> assignmentForCompletingSegment(TableConfig tableConfig, IdealState idealState, String newSegmentId) {
+    return null;
   }
 
   private static class KafkaOffsetFetcher implements Callable<Boolean> {
